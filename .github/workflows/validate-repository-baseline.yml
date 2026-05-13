@@ -1,0 +1,261 @@
+name: Validate Repository Baseline
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate-repository-baseline:
+    name: Validate repository baseline
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Load repository contents
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          mkdir repository
+          cd repository
+
+          git init
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git -c http.extraheader="AUTHORIZATION: bearer ${GITHUB_TOKEN}" fetch --no-tags --depth=1 origin "${GITHUB_SHA}"
+          git checkout --detach FETCH_HEAD
+
+      - name: Validate workflow trigger policy
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd repository
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+
+          workflow_dir = Path(".github/workflows")
+          forbidden_events = [
+              "pull_request",
+              "pull_request_target",
+              "push",
+              "schedule",
+              "workflow_run",
+              "workflow_call",
+              "repository_dispatch",
+              "issue_comment",
+              "issues",
+              "pull_request_review",
+              "deployment",
+              "page_build",
+          ]
+
+          failures = []
+
+          for path in sorted(workflow_dir.glob("*.yml")) + sorted(workflow_dir.glob("*.yaml")):
+              text = path.read_text(encoding="utf-8")
+
+              for event in forbidden_events:
+                  patterns = [
+                      rf"(?m)^\s*{re.escape(event)}\s*:",
+                      rf"(?m)^\s*-\s*{re.escape(event)}\s*$",
+                      rf"(?m)^\s*on\s*:\s*\[[^\]]*\b{re.escape(event)}\b[^\]]*\]",
+                  ]
+
+                  if any(re.search(pattern, text) for pattern in patterns):
+                      failures.append(f"{path}: forbidden trigger detected: {event}")
+
+              if not re.search(r"(?m)^\s*workflow_dispatch\s*:", text):
+                  failures.append(f"{path}: workflow_dispatch trigger is required")
+
+          if failures:
+              for failure in failures:
+                  print(failure)
+              sys.exit(1)
+
+          print("Workflow trigger policy passed")
+          PY
+
+      - name: Validate runner policy
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd repository
+
+          if grep -RInE 'runs-on:[[:space:]]*.*self-hosted|self-hosted' .github/workflows; then
+            echo "Self-hosted runner usage is forbidden in this public repository"
+            exit 1
+          fi
+
+          echo "Runner policy passed"
+
+      - name: Validate action usage policy
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd repository
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+
+          failures = []
+
+          for path in sorted(Path(".github/workflows").glob("*.yml")) + sorted(Path(".github/workflows").glob("*.yaml")):
+              for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+                  match = re.search(r"uses:\s*['\"]?([^'\"\s]+)", line)
+                  if not match:
+                      continue
+
+                  value = match.group(1)
+
+                  if not value.startswith("./"):
+                      failures.append(f"{path}:{line_number}: external action or workflow is forbidden: {value}")
+
+          if failures:
+              for failure in failures:
+                  print(failure)
+              sys.exit(1)
+
+          print("Action usage policy passed")
+          PY
+
+      - name: Validate workflow token policy
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd repository
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+
+          failures = []
+
+          for path in sorted(Path(".github/workflows").glob("*.yml")) + sorted(Path(".github/workflows").glob("*.yaml")):
+              text = path.read_text(encoding="utf-8")
+
+              if not re.search(r"(?m)^permissions:\s*$", text):
+                  failures.append(f"{path}: top-level permissions block is required")
+
+              if re.search(r"(?i)permissions:\s*write-all", text):
+                  failures.append(f"{path}: write-all permissions are forbidden")
+
+              if re.search(r"(?i)permissions:\s*read-all", text):
+                  failures.append(f"{path}: read-all shortcut is forbidden; use explicit permissions")
+
+              if re.search(r"(?i)secrets\.", text):
+                  failures.append(f"{path}: secrets context is forbidden in this public workflow baseline")
+
+          if failures:
+              for failure in failures:
+                  print(failure)
+              sys.exit(1)
+
+          print("Workflow token policy passed")
+          PY
+
+      - name: Validate sensitive file policy
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd repository
+
+          python3 - <<'PY'
+          import fnmatch
+          import subprocess
+          import sys
+
+          forbidden_patterns = [
+              ".env",
+              ".env.*",
+              "*.env",
+              "*.local",
+              "*.secret",
+              "*.secrets",
+              "*.pem",
+              "*.key",
+              "*.p8",
+              "*.p12",
+              "*.pfx",
+              "*.crt",
+              "*.csr",
+              "*.der",
+              "*.jks",
+              "*.keystore",
+              "*.asc",
+              "*.gpg",
+              "id_rsa",
+              "id_rsa.*",
+              "id_ed25519",
+              "id_ed25519.*",
+              "known_hosts",
+              "authorized_keys",
+              "ssh_config",
+              "kubeconfig",
+              "kubeconfig.*",
+              "*.kubeconfig",
+              "admin.conf",
+              "*.tfstate",
+              "*.tfstate.*",
+              "*.tfplan",
+              "*.plan",
+              "*.tfvars",
+              "*.tfvars.json",
+              "*.auto.tfvars",
+              "*.auto.tfvars.json",
+              "terraform.rc",
+              ".terraformrc",
+          ]
+
+          tracked_files = subprocess.check_output(["git", "ls-files"], text=True).splitlines()
+          failures = []
+
+          for file_path in tracked_files:
+              file_name = file_path.split("/")[-1]
+
+              for pattern in forbidden_patterns:
+                  if fnmatch.fnmatch(file_path, pattern) or fnmatch.fnmatch(file_name, pattern):
+                      failures.append(f"Forbidden tracked file: {file_path}")
+                      break
+
+          if failures:
+              for failure in failures:
+                  print(failure)
+              sys.exit(1)
+
+          print("Sensitive file policy passed")
+          PY
+
+      - name: Write validation summary
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          {
+            echo "## Repository baseline validation"
+            echo
+            echo "Status: passed"
+            echo
+            echo "Validated controls:"
+            echo
+            echo "- workflow_dispatch-only workflow policy"
+            echo "- no pull_request or pull_request_target triggers"
+            echo "- no self-hosted runner usage"
+            echo "- no external actions or external reusable workflows"
+            echo "- explicit workflow permissions"
+            echo "- no secrets context usage"
+            echo "- no tracked sensitive files"
+          } >> "$GITHUB_STEP_SUMMARY"
